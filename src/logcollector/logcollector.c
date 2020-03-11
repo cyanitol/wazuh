@@ -22,7 +22,10 @@ static int update_current(logreader **current, int *i, int *j);
 static void set_read(logreader *current, int i, int j);
 static IT_control remove_duplicates(logreader *current, int i, int j);
 static int find_duplicate_inode(logreader * lf);
-static void set_sockets();
+static void configure_files();
+static void set_file_socket_target(logreader *current);
+static void set_file_output_format(logreader *current);
+static void files_lock_init(void);
 static void check_text_only();
 static int check_pattern_expand(int do_seek);
 static void check_pattern_expand_excluded();
@@ -55,19 +58,22 @@ static pthread_mutex_t win_el_mutex;
 static pthread_mutexattr_t win_el_mutex_attr;
 #endif
 
+/* Multiple readers / one write mutex */
+static pthread_rwlock_t files_update_rwlock;
+
 static OSHash *excluded_files = NULL;
 static OSHash *excluded_binaries = NULL;
 
 /* Handle file management */
 void LogCollectorStart()
 {
-    int i = 0, j = -1, tg;
+    int i = 0, j = -1, tg = 0;
     int f_check = 0;
     int f_reload = 0;
     int f_free_excluded = 0;
     IT_control f_control = 0;
     IT_control duplicates_removed = 0;
-    logreader *current;
+    logreader *current = NULL;
 
     /* Create store data */
     excluded_files = OSHash_Create();
@@ -81,11 +87,13 @@ void LogCollectorStart()
         merror_exit(LIST_ERROR);
     }
 
-    set_sockets();
-
     // Check for expanded files
     check_pattern_expand(1);
     check_pattern_expand_excluded();
+
+    configure_files();
+
+    files_lock_init();
 
     w_mutex_init(&mutex, NULL);
 
@@ -298,6 +306,7 @@ void LogCollectorStart()
 
         /* Free hash table content for excluded files */
         if (f_free_excluded >= free_excluded_files_interval) {
+            w_rwlock_wrlock(&files_update_rwlock);
 
             mdebug1("Refreshing excluded files list.");
 
@@ -316,9 +325,12 @@ void LogCollectorStart()
             }
 
             f_free_excluded = 0;
+
+            w_rwlock_unlock(&files_update_rwlock);
         }
 
         if (f_check >= vcheck_files) {
+            w_rwlock_wrlock(&files_update_rwlock);
             int i;
             int j = -1;
             f_reload += f_check;
@@ -341,18 +353,18 @@ void LogCollectorStart()
                         }
                     }
 
-                    pthread_mutex_lock(&current->mutex);
-
                     if (current->file && current->fp) {
                         close_file(current);
                     }
-
-                    pthread_mutex_unlock(&current->mutex);
                 }
+
+                w_rwlock_unlock(&files_update_rwlock);
 
                 if (reload_delay) {
                     nanosleep(&delay, NULL);
                 }
+
+                w_rwlock_wrlock(&files_update_rwlock);
 
                 // Open files again, and restore position
 
@@ -364,8 +376,6 @@ void LogCollectorStart()
                             break;
                         }
                     }
-
-                    pthread_mutex_lock(&current->mutex);
 
                     if (current->file && current->exists) {
                         if (reload_file(current) == -1) {
@@ -381,7 +391,6 @@ void LogCollectorStart()
                                 } else {
                                     mdebug1(CURRENT_FILES, current_files, maximum_files);
                                     i--;
-                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             } else if (open_file_attempts) {
@@ -391,8 +400,6 @@ void LogCollectorStart()
                             }
                         }
                     }
-
-                    pthread_mutex_unlock(&current->mutex);
                 }
             }
 
@@ -406,11 +413,8 @@ void LogCollectorStart()
                     }
                 }
 
-                pthread_mutex_lock(&current->mutex);
-
                 /* These are the windows logs or ignored files */
                 if (!current->file) {
-                    pthread_mutex_unlock(&current->mutex);
                     continue;
                 }
 
@@ -427,14 +431,12 @@ void LogCollectorStart()
                         current->exists = 1;
 
                         handle_file(i, j, 0, 1);
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 
                     /* Variable file name */
                     else if (!current->fp && open_file_attempts - current->ign > 0) {
                         handle_file(i, j, 1, 1);
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
                 }
@@ -464,7 +466,6 @@ void LogCollectorStart()
                                 } else {
                                     mdebug1(CURRENT_FILES, current_files, maximum_files);
                                     i--;
-                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             } else if (open_file_attempts) {
@@ -520,7 +521,6 @@ void LogCollectorStart()
                             } else {
                                 mdebug2(CURRENT_FILES, current_files, maximum_files);
                                 i--;
-                                pthread_mutex_unlock(&current->mutex);
                                 continue;
                             }
                         } else if (open_file_attempts) {
@@ -560,7 +560,6 @@ void LogCollectorStart()
 
                         current->fp = NULL;
                         handle_file(i, j, 0, 1);
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 #ifdef WIN32
@@ -636,7 +635,6 @@ void LogCollectorStart()
                                 } else {
                                     mdebug2(CURRENT_FILES, current_files, maximum_files);
                                     i--;
-                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             }
@@ -657,7 +655,6 @@ void LogCollectorStart()
                 if (current->ign >= open_file_attempts) {
                     /* 999 Maximum ignore */
                     if (current->ign == 999) {
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 
@@ -676,24 +673,19 @@ void LogCollectorStart()
 
                     current->fp = NULL;
                     current->ign = 999;
-                    pthread_mutex_unlock(&current->mutex);
                     continue;
                 }
 
                 /* File not open */
                 if (!current->fp) {
                     if (current->ign >= 999) {
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     } else {
                         /* Try for a few times to open the file */
                         handle_file(i, j, 1, 1);
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
                 }
-
-                pthread_mutex_unlock(&current->mutex);
             }
 
             // Check for new files to be expanded
@@ -708,16 +700,11 @@ void LogCollectorStart()
                         }
                     }
 
-                    pthread_mutex_lock(&current->mutex);
-
                     duplicates_removed = remove_duplicates(current, i, j);
                     if (duplicates_removed == NEXT_IT) {
                         i--;
-                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
-
-                    pthread_mutex_unlock(&current->mutex);
                 }
             }
 
@@ -726,6 +713,8 @@ void LogCollectorStart()
 
             /* Check for ASCII, UTF-8 */
             check_text_only();
+
+            w_rwlock_unlock(&files_update_rwlock);
 
             if (f_reload >= reload_interval) {
                 f_reload = 0;
@@ -1561,10 +1550,10 @@ int find_duplicate_inode(logreader * lf) {
     return 0;
 }
 
-static void set_sockets() {
-    int i, j, k, t;
-    logreader *current;
-    char *file;
+static void configure_files() {
+    int i = 0, j = 0;
+    logreader *current = NULL;
+    char *file = NULL;
 
     // List read sockets
     unsigned int sk;
@@ -1572,69 +1561,95 @@ static void set_sockets() {
         mdebug1("Socket '%s' (%s) added. Location: %s", logsk[sk].name, logsk[sk].mode == IPPROTO_UDP ? "udp" : "tcp", logsk[sk].location);
     }
 
-    for (i = 0, t = -1;; i++) {
-        if (t == -1 && logff && logff[i].file) {
-            current = &logff[i];
-            file = logff[i].file;
-        } else if (globs && globs[++t].gpath){
-            current = globs[t].gfiles;
-            file = globs[t].gpath;
+    for (i = 0; logff && logff[i].file; i++) {
+        current = &logff[i];
+        file = logff[i].file;
+        // Creating the queue for this log file
+        w_msg_hash_queues_add_entry(file);
+        // Setting the target socket for the file
+        set_file_socket_target(current);
+        // Setting the log format for the file
+        set_file_output_format(current);
+    }
+
+    for (i = 0; globs && globs[i].gpath; i++) {
+        current = globs[i].gfiles;
+        // Setting the target socket for the file
+        set_file_socket_target(current);
+        // Setting the log format for the file
+        set_file_output_format(current);
+        for (j = 0; globs[i].gfiles && globs[i].gfiles[j].file; j++) {
+            // Copying target and log_target from current as it apply to all the glob
+            globs[i].gfiles[j].target = current->target;
+            globs[i].gfiles[j].log_target = current->log_target;
+            // Creating the queue for this log file
+            file = globs[i].gfiles[j].file;
+            w_msg_hash_queues_add_entry(file);
+        }
+    }
+}
+
+static void set_file_socket_target(logreader *current) {
+    int j = 0, k = 0;
+
+    if (!current)
+        return;
+    
+    os_malloc(sizeof(logtarget), current->log_target);
+
+    for (j = 0; current->target[j]; j++) {
+        os_realloc(current->log_target, (j + 2) * sizeof(logtarget), current->log_target);
+        memset(current->log_target + j, 0, 2 * sizeof(logtarget));
+
+        if (strcmp(current->target[j], "agent") == 0) {
+            current->log_target[j].log_socket = &default_agent;
+            continue;
+        }
+        int found = -1;
+        for (k = 0; logsk && logsk[k].name; k++) {
+            found = strcmp(logsk[k].name, current->target[j]);
+            if (found == 0) {
+                break;
+            }
+        }
+        if (found != 0) {
+            merror("Socket '%s' for '%s' is not defined.", current->target[j], current->file);
         } else {
-            break;
+            current->log_target[j].log_socket = &logsk[k];
         }
+    }
 
-        os_malloc(sizeof(logtarget), current->log_target);
+    memset(current->log_target + j, 0, sizeof(logtarget));
+}
 
-        for (j = 0; current->target[j]; j++) {
-            os_realloc(current->log_target, (j + 2) * sizeof(logtarget), current->log_target);
-            memset(current->log_target + j, 0, 2 * sizeof(logtarget));
+static void set_file_output_format(logreader *current) {
+    int j = 0, k = 0;
 
-            if (strcmp(current->target[j], "agent") == 0) {
-                current->log_target[j].log_socket = &default_agent;
-                w_msg_hash_queues_add_entry("agent");
-                continue;
-            }
-            int found = -1;
-            for (k = 0; logsk && logsk[k].name; k++) {
-                found = strcmp(logsk[k].name, current->target[j]);
-                if (found == 0) {
-                    break;
+    if (!current)
+        return;
+
+    if (current->out_format) {
+        for (j = 0; current->out_format[j]; ++j) {
+            if (current->out_format[j]->target) {
+                // Fill the corresponding target
+
+                for (k = 0; current->target[k]; ++k) {
+                    if (strcmp(current->target[k], current->out_format[j]->target) == 0) {
+                        current->log_target[k].format = current->out_format[j]->format;
+                        break;
+                    }
                 }
-            }
-            if (found != 0) {
-                merror_exit("Socket '%s' for '%s' is not defined.", current->target[j], file);
+
+                if (!current->target[k]) {
+                    mwarn("Log target '%s' not found for the output format of localfile '%s'.", 
+                    current->out_format[j]->target, current->file);
+                }
             } else {
-                current->log_target[j].log_socket = &logsk[k];
-                w_msg_hash_queues_add_entry(logsk[k].name);
-            }
-        }
+                // Fill the targets that don't yet have a format
 
-        memset(current->log_target + j, 0, sizeof(logtarget));
-
-        // Add output formats
-
-        if (current->out_format) {
-            for (j = 0; current->out_format[j]; ++j) {
-                if (current->out_format[j]->target) {
-                    // Fill the corresponding target
-
-                    for (k = 0; current->target[k]; ++k) {
-                        if (strcmp(current->target[k], current->out_format[j]->target) == 0) {
-                            current->log_target[k].format = current->out_format[j]->format;
-                            break;
-                        }
-                    }
-
-                    if (!current->target[k]) {
-                        mwarn("Log target '%s' not found for the output format of localfile '%s'.", current->out_format[j]->target, current->file);
-                    }
-                } else {
-                    // Fill the targets that don't yet have a format
-
-                    for (k = 0; current->target[k]; k++) {
-                        if (!current->log_target[k].format) {
-                            current->log_target[k].format = current->out_format[j]->format;
-                        }
+                for (k = 0; current->target[k]; k++) {
+                    if (!current->log_target[k].format) {
+                        current->log_target[k].format = current->out_format[j]->format;
                     }
                 }
             }
@@ -1709,17 +1724,15 @@ int w_msg_hash_queues_push(const char *str, char *file, unsigned long size, logt
     int i;
     char *file_cpy;
 
-    for (i = 0; targets[i].log_socket; i++)
-    {
-        w_mutex_lock(&mutex);
+    w_mutex_lock(&mutex);
+    msg = (w_msg_queue_t *)OSHash_Get(msg_queues_table, file);
+    w_mutex_unlock(&mutex);
 
-        msg = (w_msg_queue_t *)OSHash_Get(msg_queues_table, targets[i].log_socket->name);
-
-        w_mutex_unlock(&mutex);
-
-        if (msg) {
-            os_strdup(file, file_cpy);
-            w_msg_queue_push(msg, str, file_cpy, size, &targets[i], queue_mq);
+    if (msg) {
+        for (i = 0; targets[i].log_socket; i++)
+        {
+                os_strdup(file, file_cpy);
+                w_msg_queue_push(msg, str, file_cpy, size, &targets[i], queue_mq);
         }
     }
 
@@ -1797,85 +1810,123 @@ w_message_t * w_msg_queue_pop(w_msg_queue_t * msg){
 }
 
 void * w_output_thread(void * args){
+    int i = 0, j = 0;
+    logreader *current;
+    IT_control f_control = 0;
     char *queue_name = args;
     w_message_t *message;
     w_msg_queue_t *msg_queue;
 
-    if (msg_queue = OSHash_Get(msg_queues_table, queue_name), !msg_queue) {
-        mwarn("Could not found the '%s'.", queue_name);
-        return NULL;
-    }
-
     while(1)
     {
-        /* Pop message from the queue */
-        message = w_msg_queue_pop(msg_queue);
+        for (i = 0, j = -1;; i++) {
 
-        if (SendMSGtoSCK(logr_queue, message->buffer, message->file, message->queue_mq, message->log_target) < 0) {
-            if (strcmp(message->log_target->log_socket->name, "agent") == 0) {
-                // When dealing with this type of messages we don't want any of them to be lost
-                // Continuously attempt to reconnect to the queue and send the message.
-                int sleep_time = 5;
-
-                #ifdef CLIENT
-                merror("Unable to send message to '%s' (ossec-agentd might be down). Attempting to reconnect.", DEFAULTQPATH);
-                #else
-                merror("Unable to send message to '%s' (ossec-analysisd might be down). Attempting to reconnect.", DEFAULTQPATH);
-                #endif
-
-                while(1) {
-                    if(logr_queue = StartMQ(DEFAULTQPATH, WRITE), logr_queue > 0) {
-                        if (SendMSGtoSCK(logr_queue, message->buffer, message->file, message->queue_mq, message->log_target) == 0) {
-                            minfo("Successfully reconnected to '%s'", DEFAULTQPATH);
-                            break;  //  We sent the message successfully, we can go on.
-                        }
-                    }
-
-                    sleep(sleep_time);
-
-                    // If we failed, we will wait longer before reattempting to connect
-                    if(sleep_time < 300)
-                        sleep_time += 5;
-                }
-            } else {
-                merror(QUEUE_SEND);
-
-                if ((logr_queue = StartMQ(DEFAULTQPATH, WRITE)) < 0) {
-                    merror_exit(QUEUE_FATAL, DEFAULTQPATH);
+            if (f_control = update_current(&current, &i, &j), f_control) {
+                if (f_control == NEXT_IT) {
+                    continue;
+                } else {
+                    break;
                 }
             }
-        }
 
-        free(message->file);
-        free(message->buffer);
-        free(message);
+            if (!current->exists || !current->fp)
+                continue;
+
+            if (msg_queue = OSHash_Get(msg_queues_table, current->file), !msg_queue) {
+                mwarn("Could not found the '%s'.", queue_name);
+                return NULL;
+            }
+
+            /* Pop message from the queue */
+            message = w_msg_queue_pop(msg_queue);
+
+            if (SendMSGtoSCK(logr_queue, message->buffer, message->file, message->queue_mq, message->log_target) < 0) {
+                if (strcmp(message->log_target->log_socket->name, "agent") == 0) {
+                    // When dealing with this type of messages we don't want any of them to be lost
+                    // Continuously attempt to reconnect to the queue and send the message.
+                    int sleep_time = 5;
+
+                    #ifdef CLIENT
+                    merror("Unable to send message to '%s' (ossec-agentd might be down). Attempting to reconnect.", DEFAULTQPATH);
+                    #else
+                    merror("Unable to send message to '%s' (ossec-analysisd might be down). Attempting to reconnect.", DEFAULTQPATH);
+                    #endif
+
+                    while(1) {
+                        if(logr_queue = StartMQ(DEFAULTQPATH, WRITE), logr_queue > 0) {
+                            if (SendMSGtoSCK(logr_queue, message->buffer, message->file, message->queue_mq, message->log_target) == 0) {
+                                minfo("Successfully reconnected to '%s'", DEFAULTQPATH);
+                                break;  //  We sent the message successfully, we can go on.
+                            }
+                        }
+
+                        sleep(sleep_time);
+
+                        // If we failed, we will wait longer before reattempting to connect
+                        if(sleep_time < 300)
+                            sleep_time += 5;
+                    }
+                } else {
+                    merror(QUEUE_SEND);
+
+                    if ((logr_queue = StartMQ(DEFAULTQPATH, WRITE)) < 0) {
+                        merror_exit(QUEUE_FATAL, DEFAULTQPATH);
+                    }
+                }
+            }
+
+            free(message->file);
+            free(message->buffer);
+            free(message);
+        }
     }
 
     return NULL;
 }
 
 void w_create_output_threads(){
-    unsigned int i;
-    const OSHashNode *curr_node;
+//     unsigned int i;
+//     const OSHashNode *curr_node;
 
-    for(i = 0; i <= msg_queues_table->rows; i++){
-        if(msg_queues_table->table[i]){
-            curr_node = msg_queues_table->table[i];
+//     for(i = 0; i <= msg_queues_table->rows; i++){
+//         if(msg_queues_table->table[i]){
+//             curr_node = msg_queues_table->table[i];
 
-            /* Create one thread per valid hash entry */
-            if(curr_node->key){
-#ifndef WIN32
-                w_create_thread(w_output_thread, curr_node->key);
-#else
-                w_create_thread(NULL,
-                    0,
-                    (LPTHREAD_START_ROUTINE)w_output_thread,
-                    curr_node->key,
-                    0,
-                    NULL);
+//             /* Create one thread per valid hash entry */
+//             if(curr_node->key){
+// #ifndef WIN32
+//                 w_create_thread(w_output_thread, curr_node->key);
+// #else
+//                 w_create_thread(NULL,
+//                     0,
+//                     (LPTHREAD_START_ROUTINE)w_output_thread,
+//                     curr_node->key,
+//                     0,
+//                     NULL);
+// #endif
+//             }
+//         }
+//     }
+
+
+    int i;
+
+#ifdef WIN32
+    w_mutex_init(&win_el_mutex, &win_el_mutex_attr);
+    w_mutexattr_destroy(&win_el_mutex_attr);
 #endif
-            }
-        }
+
+    for(i = 0; i < 1; i++) {
+#ifndef WIN32
+        w_create_thread(w_output_thread,NULL);
+#else
+        w_create_thread(NULL,
+                     0,
+                     (LPTHREAD_START_ROUTINE)w_input_thread,
+                     NULL,
+                     0,
+                     NULL);
+#endif
     }
 }
 
@@ -1925,6 +1976,8 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
         /* Check which file is available */
         for (i = 0, j = -1;; i++) {
 
+            w_rwlock_rdlock(&files_update_rwlock);
+
             if (f_control = update_current(&current, &i, &j), f_control) {
                 if (f_control == NEXT_IT) {
                     continue;
@@ -1945,6 +1998,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         }
                     }
                     w_mutex_unlock(&current->mutex);
+                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 }
 
@@ -1969,6 +2023,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                             fclose(current->fp);
                             current->fp = NULL;
                             w_mutex_unlock(&current->mutex);
+                            w_rwlock_unlock(&files_update_rwlock);
                             continue;
                         }
                     }
@@ -1980,6 +2035,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                 if ((r = fgetc(current->fp)) == EOF) {
                     clearerr(current->fp);
                     w_mutex_unlock(&current->mutex);
+                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 }
 
@@ -1992,6 +2048,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                 if (current->h && (GetFileInformationByHandle(current->h, &lpFileInformation) == 0)) {
                     merror("Unable to get file information by handle.");
                     w_mutex_unlock(&current->mutex);
+                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 } else {
                     FILETIME ft_handle = lpFileInformation.ftLastWriteTime;
@@ -2010,6 +2067,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         current->fp = NULL;
                         current->h = NULL;
                         w_mutex_unlock(&current->mutex);
+                        w_rwlock_unlock(&files_update_rwlock);
                         continue;
                     }
                 }
@@ -2101,6 +2159,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         /* Try to open it again */
                         if (handle_file(i, j, 0, 1)) {
                             w_mutex_unlock(&current->mutex);
+                            w_rwlock_unlock(&files_update_rwlock);
                             continue;
                         }
     #ifdef WIN32
@@ -2120,6 +2179,8 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                     w_mutex_unlock(&current->mutex);
                 }
             }
+
+            w_rwlock_unlock(&files_update_rwlock);
         }
     }
 
@@ -2148,6 +2209,22 @@ void w_create_input_threads(){
                      NULL);
 #endif
     }
+}
+
+void files_lock_init()
+{	
+    pthread_rwlockattr_t attr;
+    pthread_rwlockattr_init(&attr);
+
+#ifdef __linux__
+    /* PTHREAD_RWLOCK_PREFER_WRITER_NP is ignored.
+     * Do not use recursive locking.
+     */	
+    pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+
+    w_rwlock_init(&files_update_rwlock, &attr);
+    pthread_rwlockattr_destroy(&attr);
 }
 
 static void check_text_only() {
